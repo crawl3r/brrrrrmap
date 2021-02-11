@@ -12,15 +12,6 @@ import (
 	"time"
 )
 
-/*
-	Input: cat a list of URLs/IPs via stdin
-
-	Aim: Perform a GET request to the current target and report it's status code
-		- Allow the user to specify the output to only show the requested status code results (i.e -s 404)
-
-	Reason: Not really sure how this differs to just using gobuster or ffuf in this intended way, but here we are. Smaller tool usage I guess?
-*/
-
 // ScanTask holds the data for an upcoming scan. The namp scans are created from these populated items
 type ScanTask struct {
 	Host             string
