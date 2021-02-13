@@ -18,9 +18,19 @@ type ScanTask struct {
 	Ports            string
 	ScanTypeSwitches string
 	Stage            int
+	ScanTypeRef      string
+}
+
+// ReportableLoot is populated on a case by case basis ready for the final output
+type ReportableLoot struct {
+	Host        string
+	Title       string
+	NmapSnippet string
+	RawOutput   string
 }
 
 var out io.Writer = os.Stdout
+var loot = []ReportableLoot{}
 
 func main() {
 	banner()
@@ -37,7 +47,7 @@ func main() {
 		for u := range ch {
 			newScan := ScanTask{
 				Host:             u,
-				Ports:            "",
+				Ports:            "-p-",
 				ScanTypeSwitches: "",
 				Stage:            1,
 			}
@@ -172,31 +182,85 @@ func parseResults(scanData ScanTask, results string) (bool, string, string) {
 	nextScanRef := ""
 	targetPorts := ""
 
-	// first things first, do we need to re-scan initially
+	// first things first, do we need to re-scan initially (icmp blocked?)
 	if strings.Contains(results, "Host seems down.") && strings.Contains(results, "try -Pn") {
 		nextScanRef = "pn"
-		targetPorts = "-p-"
+		targetPorts = ""
 	} else {
-		// we probably have results here. Let's split and loop the lines looking for our target data
-		splitLines := strings.Split(results, "\n")
-		openPorts := []string{}
+		// First let's try find some loot for this specific scan:
+		findReportableLootInResults(scanData.Host, results)
 
-		if len(splitLines) > 0 {
-			for _, l := range splitLines {
-				if strings.Contains(l, "/tcp open") {
-					openPorts = append(openPorts, strings.Split(l, "/tcp")[0])
+		// if our current scan args were NOT a deep scan or full range, then let's schedule another one with full port range
+		if strings.Contains(scanData.ScanTypeRef, "deeper") {
+			// should end it??
+		} else {
+			// Now we react based on the current scan results (loot aside) and generate our next scan for the host (if one is required)
+			splitLines := strings.Split(results, "\n")
+			openPorts := []string{}
+
+			// let's try and get a list of open ports to make sure we focus fire on the open ones with deeper analysis
+			if len(splitLines) > 0 {
+				for _, l := range splitLines {
+					if strings.Contains(l, "/tcp") && strings.Contains(l, "open") {
+						openPorts = append(openPorts, strings.Split(l, "/tcp")[0])
+					}
 				}
 			}
-		}
 
-		// if our current scan args were NOT a deep scan or full range, then we can schedule another one
-		if scanData.Ports != "-p-" && !strings.Contains(scanData.ScanTypeSwitches, "-TODO") {
-			nextScanRef = "fr"
-			targetPorts = "-p-"
+			if len(openPorts) > 0 {
+				// we have found at least 1 open port on the host. Let's schedule a deeper scan
+				fmt.Println("[*] Scheduling deeper port analysis scans for host:", scanData.Host)
+				identifiedPorts := ""
+				for _, p := range openPorts {
+					identifiedPorts += p + ","
+				}
+				// remove the last , because coding is hard
+				identifiedPorts = identifiedPorts[:len(identifiedPorts)-1]
+
+				nextScanRef = "deeper"
+				targetPorts = "-p" + identifiedPorts
+			}
+
 		}
 	}
 
 	return nextScanRef != "", nextScanRef, targetPorts
+}
+
+func findReportableLootInResults(host string, result string) {
+	splitLines := strings.Split(result, "\n")
+
+	if len(splitLines) > 0 {
+		for _, l := range splitLines {
+			// closed port outline at top of output
+			if strings.Contains(l, "Not shown:") && strings.Contains(l, "closed ports") {
+				if !doesLootAlreadyExist(host, "Closed Ports") {
+					newLoot := ReportableLoot{
+						Host:        "",
+						Title:       "Closed Ports",
+						NmapSnippet: l,
+						RawOutput:   result,
+					}
+					loot = append(loot, newLoot)
+				}
+			}
+
+			// specific closed port identification (will only be added to loot if the previous is not)
+			if strings.Contains(l, "/tcp") && strings.Contains(l, "open") {
+				if !doesLootAlreadyExist(host, "Closed Ports") {
+					newLoot := ReportableLoot{
+						Host:        "",
+						Title:       "Closed Ports",
+						NmapSnippet: l,
+						RawOutput:   result,
+					}
+					loot = append(loot, newLoot)
+				}
+			}
+
+			// TODO: add more lootables
+		}
+	}
 }
 
 func createNextTask(previousTask ScanTask, scanType string, ports string) (ScanTask, error) {
@@ -214,6 +278,7 @@ func createNextTask(previousTask ScanTask, scanType string, ports string) (ScanT
 		break
 
 	case "deeper":
+		args = "-sT" // todo: proper switches for deeper analysis
 		break
 
 	case "udp":
@@ -227,7 +292,17 @@ func createNextTask(previousTask ScanTask, scanType string, ports string) (ScanT
 		Ports:            ports,
 		ScanTypeSwitches: args,
 		Stage:            previousTask.Stage + 1,
+		ScanTypeRef:      scanType,
 	}
 
 	return newScan, nil
+}
+
+func doesLootAlreadyExist(host string, name string) bool {
+	for _, l := range loot {
+		if l.Title == name {
+			return true
+		}
+	}
+	return false
 }
