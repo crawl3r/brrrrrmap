@@ -2,6 +2,8 @@
   
 A wrapper for nmap to pass multiple hosts in and receive the output + the identified low hanging fruit. In theory, it should help give you some next steps and easy reportable items.  
   
+Nmap is slow. Hopefully this helps speed up the process for a range of hosts.  
+  
 Currently:  
 - takes a list of hosts from stdin and performs a quick initial scan  
 - reacts to initial and follows up a secondary full port range scan  

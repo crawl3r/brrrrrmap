@@ -13,11 +13,13 @@ import (
 )
 
 type Scanner struct {
-	ID             int
-	Host           string
-	CurrentTask    *ScanTask
-	NextTask       *ScanTask
-	CompletedTasks []*ScanTask
+	ID               int
+	Host             string
+	CurrentTask      *ScanTask
+	NextTask         *ScanTask
+	CompletedTasks   []*ScanTask
+	FilenameFriendly string
+	OutputDir        string
 }
 
 type ScanTask struct {
@@ -45,7 +47,7 @@ func main() {
 				ScanTypeSwitches: "-sn", // initial ping of the host
 				Stage:            1,
 				ScanTypeRef:      "sweep",
-				RawOutputName:    u + "_sweep_raw",
+				RawOutputName:    "_sweep_raw.txt",
 				IsComplete:       false,
 			}
 			initialScans <- newScan
@@ -91,6 +93,17 @@ func (s *Scanner) Start(initialTask ScanTask, i int) {
 	s.ID = i
 	s.Host = initialTask.Host
 	s.NextTask = &initialTask
+
+	filenameFriendly := strings.Replace(initialTask.Host, ".", "_", -1)
+	s.FilenameFriendly = filenameFriendly
+	s.OutputDir = filenameFriendly
+
+	err := os.Mkdir(s.OutputDir, 0755)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	s.NextTask.RawOutputName = s.OutputDir + "/" + filenameFriendly + s.NextTask.RawOutputName
 }
 
 func (s *Scanner) Run() {
@@ -139,7 +152,7 @@ func (s *Scanner) CreateNewTask(previousTask *ScanTask, scanType string, ports s
 		ScanTypeSwitches: args,
 		Stage:            previousTask.Stage + 1,
 		ScanTypeRef:      scanType,
-		RawOutputName:    previousTask.Host + "_" + scanType + "_raw",
+		RawOutputName:    s.OutputDir + "/" + s.FilenameFriendly + "_" + scanType + "_raw.txt",
 		IsComplete:       false,
 	}
 
@@ -175,9 +188,13 @@ func generateCommandFromSettings(scanTask *ScanTask) []string {
 
 	if scanTask.ScanTypeSwitches != "" {
 		// specific scan data
+		// TODO
 	} else {
 		// likely the initial scan, so we don't have any extra information to add here
 	}
+
+	args = append(args, "-oN")
+	args = append(args, scanTask.RawOutputName)
 
 	// the last thing we do is chuck on the target host providing it has been filled in correctly
 	if scanTask.Host != "" {
@@ -190,6 +207,7 @@ func generateCommandFromSettings(scanTask *ScanTask) []string {
 func fireOffScan(args []string) string {
 	// fire off nmap scan with the passed in args
 	out, err := exec.Command("nmap", args...).Output()
+
 	if err != nil {
 		log.Fatal(err)
 	}
