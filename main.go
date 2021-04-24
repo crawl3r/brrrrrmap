@@ -12,7 +12,14 @@ import (
 	"time"
 )
 
-// ScanTask holds the data for an upcoming scan. The namp scans are created from these populated items
+type Scanner struct {
+	ID             int
+	Host           string
+	CurrentTask    *ScanTask
+	NextTask       *ScanTask
+	CompletedTasks []*ScanTask
+}
+
 type ScanTask struct {
 	Host             string
 	Ports            string
@@ -20,28 +27,14 @@ type ScanTask struct {
 	Stage            int
 	ScanTypeRef      string
 	RawOutputName    string
-}
-
-// ReportableLoot is populated on a case by case basis ready for the final output
-type ReportableLoot struct {
-	Host        string
-	Title       string
-	NmapSnippet string
-	RawOutput   string
+	IsComplete       bool
 }
 
 var out io.Writer = os.Stdout
-var loot = []ReportableLoot{}
 
 func main() {
-	banner()
-	fmt.Println("")
-
 	writer := bufio.NewWriter(out)
 	initialScans := make(chan ScanTask, 1)
-	followUpScans := []ScanTask{}
-	var wg sync.WaitGroup
-
 	ch := readStdin()
 	go func() {
 		//translate stdin channel to initial scans channel
@@ -53,6 +46,7 @@ func main() {
 				Stage:            1,
 				ScanTypeRef:      "sweep",
 				RawOutputName:    u + "_sweep_raw",
+				IsComplete:       false,
 			}
 			initialScans <- newScan
 		}
@@ -71,75 +65,105 @@ func main() {
 		}
 	}()
 
-	// fire off the initial set of scans. This will likely just result in a set of 'nmap <host>' scans. We then adapt after this.
-	for {
-		for u := range initialScans {
-			wg.Add(1)
-			go func(scanTask ScanTask) {
-				defer wg.Done()
-				fmt.Println("Performing the scan of:", scanTask.Host)
-				fmt.Println("[ Stage", scanTask.Stage, "] Host:", scanTask.Host, "Ports:", scanTask.Ports, "Args:", scanTask.ScanTypeSwitches)
+	var wg sync.WaitGroup
+	scanners := []*Scanner{}
 
-				cmd := generateCommandFromSettings(scanTask)
-				result := fireOffScan(cmd)
-				needAnotherScan, scanTypeRef, targetPorts := parseResults(scanTask, result)
+	for s := range initialScans {
+		newScanner := &Scanner{}
+		newScanner.Start(s, 1)
 
-				if needAnotherScan {
-					newTask, err := createNextTask(scanTask, scanTypeRef, targetPorts)
-					if err != nil {
-						return
-					}
+		wg.Add(1)
+		go func(newScanner *Scanner) {
+			defer wg.Done()
 
-					followUpScans = append(followUpScans, newTask)
-				}
-			}(u)
-		}
+			newScanner.Run()
+		}(newScanner)
 
-		wg.Wait()
-
-		if len(followUpScans) > 0 {
-			initialScans = make(chan ScanTask, 1)
-
-			go func() {
-				// refill the initialScans channel with the follow up scan tasks gathered previously
-				for _, s := range followUpScans {
-					initialScans <- s
-				}
-				close(initialScans)
-				followUpScans = []ScanTask{}
-			}()
-		} else {
-			break // quit the 'while' loop
-		}
+		scanners = append(scanners, newScanner)
 	}
 
-	// just in case anything is still in buffer
+	wg.Wait()
+
 	writer.Flush()
 }
 
-func banner() {
-	fmt.Println("---------------------------------------------------")
-	fmt.Println("Brrrrrmap -> skidlife")
-	fmt.Println("")
-	fmt.Println("---------------------------------------------------")
+func (s *Scanner) Start(initialTask ScanTask, i int) {
+	s.ID = i
+	s.Host = initialTask.Host
+	s.NextTask = &initialTask
 }
 
-func readStdin() <-chan string {
-	lines := make(chan string)
-	go func() {
-		defer close(lines)
-		sc := bufio.NewScanner(os.Stdin)
-		for sc.Scan() {
-			url := strings.ToLower(sc.Text())
-			if url != "" {
-				lines <- url
-			}
+func (s *Scanner) Run() {
+	// fire off our first task
+	fmt.Printf("[***] Starting first scan for: %s\n", s.Host)
+	s.DoNextTask()
+
+	// run forever, until we do NOT have a next task anyway
+	for {
+		if s.CurrentTask.IsComplete == true && s.NextTask != nil {
+			s.DoNextTask()
+		} else {
+			break
 		}
-	}()
-	return lines
+	}
 }
 
-func generateCommandFromSettings(scanTask ScanTask) []string {
+func (s *Scanner) CreateNewTask(previousTask *ScanTask, scanType string, ports string) {
+	args := ""
+
+	// TODO: allow multiple scanTypes to be specified: i.e pn|fr|deeper
+	switch scanType {
+	case "quick_nodiscovery":
+		args = "-Pn"
+		ports = ""
+		break
+
+	case "fullrange":
+		args = "-sT"
+		ports = "-p-"
+		break
+
+	case "deeper":
+		args = "-sT" // todo: proper switches for deeper analysis
+		break
+
+	case "udp":
+		args = "-sU"
+		ports = "--top-ports 100"
+		break
+	}
+
+	newScan := &ScanTask{
+		Host:             previousTask.Host,
+		Ports:            ports,
+		ScanTypeSwitches: args,
+		Stage:            previousTask.Stage + 1,
+		ScanTypeRef:      scanType,
+		RawOutputName:    previousTask.Host + "_" + scanType + "_raw",
+		IsComplete:       false,
+	}
+
+	s.NextTask = newScan
+}
+
+func (s *Scanner) DoNextTask() {
+	s.CurrentTask = s.NextTask
+	s.NextTask = nil
+
+	cmd := generateCommandFromSettings(s.CurrentTask)
+	result := fireOffScan(cmd)
+	needAnotherScan, scanTypeRef, targetPorts := parseResults(s.CurrentTask, result)
+
+	s.CompletedTasks = append(s.CompletedTasks, s.CurrentTask)
+	s.CurrentTask.IsComplete = true
+
+	if needAnotherScan {
+		s.CreateNewTask(s.CurrentTask, scanTypeRef, targetPorts)
+	}
+}
+
+//
+func generateCommandFromSettings(scanTask *ScanTask) []string {
 	args := []string{}
 
 	// check the scan task port information and add the data as required
@@ -173,7 +197,7 @@ func fireOffScan(args []string) string {
 	return string(out)
 }
 
-func parseResults(scanData ScanTask, results string) (bool, string, string) {
+func parseResults(scanData *ScanTask, results string) (bool, string, string) {
 	// pingsweep -> just a ping sweep with -sn to check if hosts are up
 	// quick_nodiscovery -> common ports with -Pn
 	// fullrange -> full range port look up as we got a successful initial scan
@@ -206,7 +230,7 @@ func parseResults(scanData ScanTask, results string) (bool, string, string) {
 		// host is down if we didn't go in the above
 	} else {
 		// First let's try find some loot for this specific scan:
-		findReportableLootInResults(scanData.Host, results)
+		// findReportableLootInResults(scanData.Host, results)
 
 		// if our current scan args were NOT a deep scan or full range, then let's schedule another one with full port range
 		if strings.Contains(scanData.ScanTypeRef, "deeper") {
@@ -244,97 +268,18 @@ func parseResults(scanData ScanTask, results string) (bool, string, string) {
 	return nextScanRef != "", nextScanRef, targetPorts
 }
 
-func findReportableLootInResults(host string, result string) {
-	splitLines := strings.Split(result, "\n")
-
-	if len(splitLines) > 0 {
-		for _, l := range splitLines {
-			// closed port outline at top of output
-			if strings.Contains(l, "Not shown:") && strings.Contains(l, "closed ports") {
-				//if !doesLootAlreadyExist(host, "Closed Ports") {
-				newLoot := ReportableLoot{
-					Host:        "",
-					Title:       "Closed Ports",
-					NmapSnippet: l,
-					RawOutput:   result,
-				}
-				loot = append(loot, newLoot)
-				//}
+// ---- input from stdin
+func readStdin() <-chan string {
+	lines := make(chan string)
+	go func() {
+		defer close(lines)
+		sc := bufio.NewScanner(os.Stdin)
+		for sc.Scan() {
+			url := strings.ToLower(sc.Text())
+			if url != "" {
+				lines <- url
 			}
-
-			// specific closed port identification (will only be added to loot if the previous is not)
-			if strings.Contains(l, "/tcp") && strings.Contains(l, "closed") {
-				//if !doesLootAlreadyExist(host, "Closed Ports") {
-				newLoot := ReportableLoot{
-					Host:        "",
-					Title:       "Closed Ports",
-					NmapSnippet: l,
-					RawOutput:   result,
-				}
-				loot = append(loot, newLoot)
-				//}
-			}
-
-			// cleartext web servers
-			if strings.Contains(l, "/tcp") && strings.Contains(l, "open") && strings.Contains(l, "http") && !strings.Contains(l, "https") {
-				//if !doesLootAlreadyExist(host, "HTTP Webserver") {
-				newLoot := ReportableLoot{
-					Host:        "",
-					Title:       "HTTP Webserver",
-					NmapSnippet: l,
-					RawOutput:   result,
-				}
-				loot = append(loot, newLoot)
-				//}
-			}
-
-			// TODO: add more lootables
 		}
-	}
-}
-
-func createNextTask(previousTask ScanTask, scanType string, ports string) (ScanTask, error) {
-	args := ""
-
-	// TODO: allow multiple scanTypes to be specified: i.e pn|fr|deeper
-	switch scanType {
-	case "quick_nodiscovery":
-		args = "-Pn"
-		ports = ""
-		break
-
-	case "fullrange":
-		args = "-sT"
-		ports = "-p-"
-		break
-
-	case "deeper":
-		args = "-sT" // todo: proper switches for deeper analysis
-		break
-
-	case "udp":
-		args = "-sU"
-		ports = "--top-ports 100"
-		break
-	}
-
-	newScan := ScanTask{
-		Host:             previousTask.Host,
-		Ports:            ports,
-		ScanTypeSwitches: args,
-		Stage:            previousTask.Stage + 1,
-		ScanTypeRef:      scanType,
-		RawOutputName:    previousTask.Host + "_" + scanType + "_raw",
-	}
-
-	return newScan, nil
-}
-
-func doesLootAlreadyExist(host string, name string) bool {
-	for _, l := range loot {
-		if l.Title == name {
-			return true
-		}
-	}
-	return false
+	}()
+	return lines
 }
