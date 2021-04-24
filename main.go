@@ -19,6 +19,7 @@ type ScanTask struct {
 	ScanTypeSwitches string
 	Stage            int
 	ScanTypeRef      string
+	RawOutputName    string
 }
 
 // ReportableLoot is populated on a case by case basis ready for the final output
@@ -47,9 +48,11 @@ func main() {
 		for u := range ch {
 			newScan := ScanTask{
 				Host:             u,
-				Ports:            "-p-",
-				ScanTypeSwitches: "",
+				Ports:            "",
+				ScanTypeSwitches: "-sn", // initial ping of the host
 				Stage:            1,
+				ScanTypeRef:      "sweep",
+				RawOutputName:    u + "_sweep_raw",
 			}
 			initialScans <- newScan
 		}
@@ -171,8 +174,9 @@ func fireOffScan(args []string) string {
 }
 
 func parseResults(scanData ScanTask, results string) (bool, string, string) {
-	// pn -> adds the -Pn as we want to skip look up
-	// fr -> full range port look up as we got a successful initial scan
+	// pingsweep -> just a ping sweep with -sn to check if hosts are up
+	// quick_nodiscovery -> common ports with -Pn
+	// fullrange -> full range port look up as we got a successful initial scan
 	// deeper -> deeper scan of the target ports that were identified from this result set
 	// udp -> do a quick UDP look up
 
@@ -182,10 +186,24 @@ func parseResults(scanData ScanTask, results string) (bool, string, string) {
 	nextScanRef := ""
 	targetPorts := ""
 
-	// first things first, do we need to re-scan initially (icmp blocked?)
-	if strings.Contains(results, "Host seems down.") && strings.Contains(results, "try -Pn") {
-		nextScanRef = "pn"
-		targetPorts = ""
+	if scanData.ScanTypeRef == "sweep" {
+		if strings.Contains(results, "Host is up (") {
+			// host is up, schedule a full range scan on TCP
+			nextScanRef = "fullrange"
+			targetPorts = "-p-"
+		} else {
+			// is host down? Let's force a quick -Pn scan anyway to check common ports
+			nextScanRef = "quick_nodiscovery"
+			targetPorts = ""
+		}
+	} else if scanData.ScanTypeRef == "quick_nodiscovery" {
+		// this was our 2nd attempt at seeing if the host was up, if they have ICMP disabled
+		if strings.Contains(results, "Host is up (") {
+			// host is up, schedule a full range scan on TCP
+			nextScanRef = "fullrange"
+			targetPorts = "-p-"
+		}
+		// host is down if we didn't go in the above
 	} else {
 		// First let's try find some loot for this specific scan:
 		findReportableLootInResults(scanData.Host, results)
@@ -220,7 +238,6 @@ func parseResults(scanData ScanTask, results string) (bool, string, string) {
 				nextScanRef = "deeper"
 				targetPorts = "-p" + identifiedPorts
 			}
-
 		}
 	}
 
@@ -234,28 +251,41 @@ func findReportableLootInResults(host string, result string) {
 		for _, l := range splitLines {
 			// closed port outline at top of output
 			if strings.Contains(l, "Not shown:") && strings.Contains(l, "closed ports") {
-				if !doesLootAlreadyExist(host, "Closed Ports") {
-					newLoot := ReportableLoot{
-						Host:        "",
-						Title:       "Closed Ports",
-						NmapSnippet: l,
-						RawOutput:   result,
-					}
-					loot = append(loot, newLoot)
+				//if !doesLootAlreadyExist(host, "Closed Ports") {
+				newLoot := ReportableLoot{
+					Host:        "",
+					Title:       "Closed Ports",
+					NmapSnippet: l,
+					RawOutput:   result,
 				}
+				loot = append(loot, newLoot)
+				//}
 			}
 
 			// specific closed port identification (will only be added to loot if the previous is not)
-			if strings.Contains(l, "/tcp") && strings.Contains(l, "open") {
-				if !doesLootAlreadyExist(host, "Closed Ports") {
-					newLoot := ReportableLoot{
-						Host:        "",
-						Title:       "Closed Ports",
-						NmapSnippet: l,
-						RawOutput:   result,
-					}
-					loot = append(loot, newLoot)
+			if strings.Contains(l, "/tcp") && strings.Contains(l, "closed") {
+				//if !doesLootAlreadyExist(host, "Closed Ports") {
+				newLoot := ReportableLoot{
+					Host:        "",
+					Title:       "Closed Ports",
+					NmapSnippet: l,
+					RawOutput:   result,
 				}
+				loot = append(loot, newLoot)
+				//}
+			}
+
+			// cleartext web servers
+			if strings.Contains(l, "/tcp") && strings.Contains(l, "open") && strings.Contains(l, "http") && !strings.Contains(l, "https") {
+				//if !doesLootAlreadyExist(host, "HTTP Webserver") {
+				newLoot := ReportableLoot{
+					Host:        "",
+					Title:       "HTTP Webserver",
+					NmapSnippet: l,
+					RawOutput:   result,
+				}
+				loot = append(loot, newLoot)
+				//}
 			}
 
 			// TODO: add more lootables
@@ -268,11 +298,12 @@ func createNextTask(previousTask ScanTask, scanType string, ports string) (ScanT
 
 	// TODO: allow multiple scanTypes to be specified: i.e pn|fr|deeper
 	switch scanType {
-	case "pn":
+	case "quick_nodiscovery":
 		args = "-Pn"
+		ports = ""
 		break
 
-	case "fr":
+	case "fullrange":
 		args = "-sT"
 		ports = "-p-"
 		break
@@ -293,6 +324,7 @@ func createNextTask(previousTask ScanTask, scanType string, ports string) (ScanT
 		ScanTypeSwitches: args,
 		Stage:            previousTask.Stage + 1,
 		ScanTypeRef:      scanType,
+		RawOutputName:    previousTask.Host + "_" + scanType + "_raw",
 	}
 
 	return newScan, nil
